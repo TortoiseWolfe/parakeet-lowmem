@@ -15,18 +15,26 @@ The image here is LocalAI's own parakeet-cpp backend image with one file replace
 In LocalAI's web page, open Backends, then install from an image:
 
 - URI: `oci://ghcr.io/tortoisewolfe/parakeet-lowmem:v4.11.0-1`
-- Name: `cpu-parakeet-cpp`
-- Alias: `parakeet-cpp`
+- Name: `parakeet-lowmem`
+- Alias: leave empty
 
-The same thing through the API:
+It installs and runs under its own name, so it sits beside upstream's `parakeet-cpp` backend instead of replacing it. The form in the page sends the same call as this, which is what was tested (nobody clicked through the page; its code, in LocalAI v4.11.0, makes the call):
 
 ```
 curl -X POST http://localhost:8080/api/backends/install-external \
   -H 'Content-Type: application/json' \
-  -d '{"uri":"oci://ghcr.io/tortoisewolfe/parakeet-lowmem:v4.11.0-1","name":"cpu-parakeet-cpp","alias":"parakeet-cpp"}'
+  -d '{"uri":"oci://ghcr.io/tortoisewolfe/parakeet-lowmem:v4.11.0-1","name":"parakeet-lowmem"}'
 ```
 
 It answers with a job ID. Watch it at `/api/backends/job/<jobID>` until it says `"processed":true`.
+
+Then point the model at it. In the model's config, set the backend line to the new name:
+
+```
+backend: parakeet-lowmem
+```
+
+A model that still says `backend: parakeet-cpp` keeps using upstream's backend, not this one.
 
 Then set these on the LocalAI service. They do nothing without the patch:
 
@@ -52,7 +60,7 @@ One hour, three speakers, 2560 MB cap, 4 processors:
 - Every segment got the right speaker label.
 - Without the patch: 7.6 GB.
 
-Install check, 8 Nov 2026: the published `v4.11.0-1` image, pulled with no login, was installed into a fresh LocalAI v4.11.0 with the call above. A 15 minute, six speaker recording of public read speech (LibriSpeech dev-clean) then ran under a 2560 MB cap. Peak memory was 1.91 GB, including the install, with 126 segments and a word error rate of 2.66%, the same as the earlier build. No cut dropped or repeated a word.
+Install check, 8 Nov 2026: the published `v4.11.0-1` image, pulled with no login, was installed into a fresh LocalAI v4.11.0 with the call above under the name `parakeet-lowmem`, with the model's backend set to `parakeet-lowmem`. An 18 minute, six speaker recording of public read speech (LibriSpeech dev-clean) peaked at 1.89 GB under the 2560 MB cap, 157 segments, word error rate 3.70%, the same as the earlier install under upstream's name. The earlier check, installed as `cpu-parakeet-cpp`: a 15 minute, six speaker recording of public read speech (LibriSpeech dev-clean) then ran under a 2560 MB cap. Peak memory was 1.91 GB, including the install, with 126 segments and a word error rate of 2.66%, the same as the earlier build. No cut dropped or repeated a word.
 
 Windows test, public read speech (LibriSpeech dev-clean, 15 to 22 minutes):
 
