@@ -21,10 +21,12 @@ In LocalAI's web page, open Backends, then install from an image:
 The same thing through the API:
 
 ```
-curl -X POST http://localhost:8080/backends/apply \
+curl -X POST http://localhost:8080/api/backends/install-external \
   -H 'Content-Type: application/json' \
-  -d '{"id":"oci://ghcr.io/tortoisewolfe/parakeet-lowmem:v4.11.0-1","name":"cpu-parakeet-cpp","alias":"parakeet-cpp"}'
+  -d '{"uri":"oci://ghcr.io/tortoisewolfe/parakeet-lowmem:v4.11.0-1","name":"cpu-parakeet-cpp","alias":"parakeet-cpp"}'
 ```
+
+It answers with a job ID. Watch it at `/api/backends/job/<jobID>` until it says `"processed":true`.
 
 Then set these on the LocalAI service. They do nothing without the patch:
 
@@ -49,6 +51,8 @@ One hour, three speakers, 2560 MB cap, 4 processors:
 - Peak memory 2.0 to 2.2 GB over three runs, 4 to 5 minutes of run time.
 - Every segment got the right speaker label.
 - Without the patch: 7.6 GB.
+
+Install check, 8 Nov 2026: the published `v4.11.0-1` image, pulled with no login, was installed into a fresh LocalAI v4.11.0 with the call above. A 15 minute, six speaker recording of public read speech (LibriSpeech dev-clean) then ran under a 2560 MB cap. Peak memory was 1.91 GB, including the install, with 126 segments and a word error rate of 2.66%, the same as the earlier build. No cut dropped or repeated a word.
 
 Windows test, public read speech (LibriSpeech dev-clean, 15 to 22 minutes):
 
