@@ -1,0 +1,717 @@
+From df2350c2ac396ec085500e0dc040ea49ea7c0e7e Mon Sep 17 00:00:00 2001
+Subject: [PATCH] parakeet-cpp: bound memory on long recordings
+
+Window the speech-to-text over overlapping pieces cut at the longest pause,
+feed the diarizer through the streaming C API so speaker labels stay stable,
+and decode WAV in blocks instead of growing a []int. One hour of audio now
+peaks near 2.8 GB instead of 7.6 GB.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ backend/go/parakeet-cpp/diarize_stream.go |  87 +++++++++++++
+ backend/go/parakeet-cpp/goparakeetcpp.go  |  93 ++++++++++----
+ backend/go/parakeet-cpp/main.go           |   6 +
+ backend/go/parakeet-cpp/speakers.go       |   3 +
+ backend/go/parakeet-cpp/wavread.go        |  60 +++++++++
+ backend/go/parakeet-cpp/wavread_test.go   |  82 ++++++++++++
+ backend/go/parakeet-cpp/windowed.go       | 148 ++++++++++++++++++++++
+ backend/go/parakeet-cpp/windowed_test.go  | 111 ++++++++++++++++
+ 8 files changed, 567 insertions(+), 23 deletions(-)
+ create mode 100644 backend/go/parakeet-cpp/diarize_stream.go
+ create mode 100644 backend/go/parakeet-cpp/wavread.go
+ create mode 100644 backend/go/parakeet-cpp/wavread_test.go
+ create mode 100644 backend/go/parakeet-cpp/windowed.go
+ create mode 100644 backend/go/parakeet-cpp/windowed_test.go
+
+diff --git a/backend/go/parakeet-cpp/diarize_stream.go b/backend/go/parakeet-cpp/diarize_stream.go
+new file mode 100644
+index 0000000..520bd80
+--- /dev/null
++++ b/backend/go/parakeet-cpp/diarize_stream.go
+@@ -0,0 +1,87 @@
++package main
++
++import (
++	"fmt"
++	"sort"
++	"unsafe"
++)
++
++// Diarization of a long clip in pieces.
++//
++// parakeet_capi_diarize_pcm takes the whole clip in one call and builds its
++// log-mel features for all of it first, so peak memory grows with the length
++// of the recording (about 0.06 GB per minute of audio). The streaming
++// diarizer used here loads the same checkpoint but is a different code path
++// from diarize_pcm: it takes the audio in pieces, with the latency setting
++// passed explicitly, and keeps only a fixed-size speaker cache between them,
++// so a speaker keeps its number across pieces. Its segments are not
++// guaranteed to equal the whole-clip call's; checked on test recordings only.
++
++// Streaming diarization over PCM (parakeet_capi_diarize_stream_*), registered
++// in main.go. All nil on an older libparakeet.so.
++var (
++	CppDiarStreamBeginLatency func(ctx uintptr, latency int32) uintptr
++	CppDiarStreamFeed         func(s uintptr, pcm *float32, nSamples int32, isLast int32, out *uintptr, nOut *int32) int32
++	CppDiarStreamFree         func(s uintptr)
++	CppFreeDiarSegments       func(segs uintptr)
++)
++
++// cDiarSegment mirrors parakeet_diar_segment (parakeet_capi.h).
++type cDiarSegment struct {
++	Speaker int32
++	Start   float32
++	End     float32
++}
++
++// diarizeSegmentsStreamed feeds pcm to the streaming diarizer diarFeedSec
++// seconds at a time and returns the segments in start order.
++func (p *ParakeetCpp) diarizeSegmentsStreamed(pcm []float32) ([]diarizeSegmentJSON, error) {
++	p.engineMu.Lock()
++	defer p.engineMu.Unlock()
++	if p.diarCtx == 0 {
++		return nil, fmt.Errorf("parakeet-cpp: diarization model is not loaded")
++	}
++	stream := CppDiarStreamBeginLatency(p.diarCtx, diarLatencyModel) // latency passed explicitly; diarize_pcm may use another
++	if stream == 0 {
++		return nil, fmt.Errorf("parakeet-cpp: diarize stream begin failed: %s", CppLastError(p.diarCtx))
++	}
++	defer CppDiarStreamFree(stream)
++
++	var out []diarizeSegmentJSON
++	piece := p.diarFeedSec * asrSampleRate
++	for off := 0; off < len(pcm); off += piece {
++		end := min(off+piece, len(pcm))
++		last := int32(0)
++		if end == len(pcm) {
++			last = 1
++		}
++		var segs uintptr
++		var n int32
++		if rc := CppDiarStreamFeed(stream, &pcm[off], int32(end-off), last, &segs, &n); rc != 0 {
++			return nil, fmt.Errorf("parakeet-cpp: diarize stream feed failed: %s", CppLastError(p.diarCtx))
++		}
++		out = append(out, readDiarSegments(segs, int(n))...)
++	}
++	sort.SliceStable(out, func(i, j int) bool {
++		if out[i].Start != out[j].Start {
++			return out[i].Start < out[j].Start
++		}
++		return out[i].Speaker < out[j].Speaker
++	})
++	return out, nil
++}
++
++// readDiarSegments copies n segments out of a C-owned array and frees it.
++func readDiarSegments(segs uintptr, n int) []diarizeSegmentJSON {
++	if segs == 0 || n <= 0 {
++		return nil
++	}
++	p := unsafe.Pointer(segs) //nolint:govet // C-owned malloc'd buffer, not Go-GC memory (see goStringFromCPtr)
++	cs := unsafe.Slice((*cDiarSegment)(p), n)
++	res := make([]diarizeSegmentJSON, n)
++	for i, c := range cs {
++		res[i] = diarizeSegmentJSON{Speaker: int(c.Speaker), Start: float64(c.Start), End: float64(c.End)}
++	}
++	CppFreeDiarSegments(segs)
++	return res
++}
+diff --git a/backend/go/parakeet-cpp/goparakeetcpp.go b/backend/go/parakeet-cpp/goparakeetcpp.go
+index 04c26bf..9987450 100644
+--- a/backend/go/parakeet-cpp/goparakeetcpp.go
++++ b/backend/go/parakeet-cpp/goparakeetcpp.go
+@@ -13,7 +13,6 @@ import (
+ 	"time"
+ 	"unsafe"
+ 
+-	"github.com/go-audio/wav"
+ 	"github.com/mudler/LocalAI/pkg/grpc/base"
+ 	"github.com/mudler/LocalAI/pkg/grpc/grpcerrors"
+ 	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
+@@ -239,6 +238,17 @@ type ParakeetCpp struct {
+ 	// YAML option, default 0=off). When >0 it adds NeMo's silence-gap split on
+ 	// top of the punctuation split; converted to seconds via the JSON frame_sec.
+ 	segmentGapFrames int
++	// asrWindowSec / asrOverlapSec: when asrWindowSec > 0, clips longer than
++	// one window are transcribed in overlapping windows (windowed.go) so peak
++	// memory follows the window, not the recording. Model YAML options
++	// asr_window_seconds (default 0 = off) and asr_window_overlap_seconds
++	// (default 20).
++	asrWindowSec  int
++	asrOverlapSec int
++	// diarFeedSec: when > 0, speaker labelling feeds the whole clip to the
++	// streaming diarizer in pieces of this many seconds instead of one call
++	// (model option diarization_feed_seconds, default 0 = off).
++	diarFeedSec int
+ }
+ 
+ // Load is the LocalAI gRPC entry point for LoadModel: it calls
+@@ -269,6 +279,13 @@ func (p *ParakeetCpp) Load(opts *pb.ModelOptions) error {
+ 	// default matches NeMo's default (punctuation-only segments); when set it
+ 	// additionally splits segments on inter-word silence (see transcriptResultFromDoc).
+ 	p.segmentGapFrames = optInt(opts, "segment_gap_threshold", 0)
++	p.asrWindowSec = max(optInt(opts, "asr_window_seconds", 0), 0)
++	p.asrOverlapSec = max(optInt(opts, "asr_window_overlap_seconds", 20), 0)
++	p.diarFeedSec = max(optInt(opts, "diarization_feed_seconds", 0), 0)
++	if p.asrWindowSec > 0 {
++		xlog.Info("parakeet-cpp: windowed transcription on",
++			"asr_window_seconds", p.asrWindowSec, "asr_window_overlap_seconds", p.asrOverlapSec)
++	}
+ 
+ 	// The batcher only ever drives the ASR context; a diarization/sound
+ 	// primary with no asr_model companion has no ctxPtr and needs none.
+@@ -428,24 +445,9 @@ func (p *ParakeetCpp) AudioTranscription(ctx context.Context, opts *pb.Transcrip
+ 	if err != nil {
+ 		return pb.TranscriptResult{}, err
+ 	}
+-	rep := make(chan batchReply, 1)
+-	select {
+-	case p.bat.submit <- &batchRequest{pcm: pcm, decoder: 0, language: opts.GetLanguage(), reply: rep}:
+-	case <-ctx.Done():
+-		return pb.TranscriptResult{}, status.Error(codes.Canceled, "transcription cancelled")
+-	}
+-	var res batchReply
+-	select {
+-	case res = <-rep:
+-	case <-ctx.Done():
+-		return pb.TranscriptResult{}, status.Error(codes.Canceled, "transcription cancelled")
+-	}
+-	if res.err != nil {
+-		return pb.TranscriptResult{}, res.err
+-	}
+-	var doc transcriptJSON
+-	if err := json.Unmarshal([]byte(res.json), &doc); err != nil {
+-		return pb.TranscriptResult{}, fmt.Errorf("parakeet-cpp: decode transcript json: %w", err)
++	doc, err := p.transcribePCMWindowed(ctx, pcm, opts.GetLanguage())
++	if err != nil {
++		return pb.TranscriptResult{}, err
+ 	}
+ 
+ 	// With a diarization_model companion, label each segment with its speaker.
+@@ -957,14 +959,13 @@ func decodeWavMono16k(path string) ([]float32, float32, error) {
+ 	}
+ 	defer func() { _ = fh.Close() }()
+ 
+-	buf, err := wav.NewDecoder(fh).FullPCMBuffer()
++	data, rate, err := readWavFloat32(fh)
+ 	if err != nil {
+ 		return nil, 0, err
+ 	}
+-	data := buf.AsFloat32Buffer().Data
+ 	var duration float32
+-	if buf.Format != nil && buf.Format.SampleRate > 0 {
+-		duration = float32(len(data)) / float32(buf.Format.SampleRate)
++	if rate > 0 {
++		duration = float32(len(data)) / float32(rate)
+ 	}
+ 	return data, duration, nil
+ }
+@@ -1016,3 +1017,49 @@ func goStringFromCPtr(cptr uintptr) string {
+ 	}
+ 	return string(unsafe.Slice((*byte)(p), n))
+ }
++
++// transcribePCM submits one clip to the batcher and decodes its JSON reply.
++func (p *ParakeetCpp) transcribePCM(ctx context.Context, pcm []float32, language string) (transcriptJSON, error) {
++	rep := make(chan batchReply, 1)
++	select {
++	case p.bat.submit <- &batchRequest{pcm: pcm, decoder: 0, language: language, reply: rep}:
++	case <-ctx.Done():
++		return transcriptJSON{}, status.Error(codes.Canceled, "transcription cancelled")
++	}
++	var res batchReply
++	select {
++	case res = <-rep:
++	case <-ctx.Done():
++		return transcriptJSON{}, status.Error(codes.Canceled, "transcription cancelled")
++	}
++	if res.err != nil {
++		return transcriptJSON{}, res.err
++	}
++	var doc transcriptJSON
++	if err := json.Unmarshal([]byte(res.json), &doc); err != nil {
++		return transcriptJSON{}, fmt.Errorf("parakeet-cpp: decode transcript json: %w", err)
++	}
++	return doc, nil
++}
++
++// transcribePCMWindowed transcribes pcm in overlapping windows one after the
++// other when asr_window_seconds is set and the clip is longer than a window,
++// and as one clip otherwise (see windowed.go).
++func (p *ParakeetCpp) transcribePCMWindowed(ctx context.Context, pcm []float32, language string) (transcriptJSON, error) {
++	spans := asrWindows(len(pcm), p.asrWindowSec*asrSampleRate, p.asrOverlapSec*asrSampleRate)
++	if len(spans) == 1 {
++		return p.transcribePCM(ctx, pcm, language)
++	}
++	docs := make([]transcriptJSON, len(spans))
++	starts := make([]float64, len(spans))
++	ends := make([]float64, len(spans))
++	for i, sp := range spans {
++		d, err := p.transcribePCM(ctx, pcm[sp.start:sp.end], language)
++		if err != nil {
++			return transcriptJSON{}, err
++		}
++		docs[i], starts[i], ends[i] = d, float64(sp.start)/asrSampleRate, float64(sp.end)/asrSampleRate
++		xlog.Debug("parakeet-cpp: window transcribed", "window", i+1, "of", len(spans), "words", len(d.Words))
++	}
++	return mergeWindowDocs(docs, starts, ends), nil
++}
+diff --git a/backend/go/parakeet-cpp/main.go b/backend/go/parakeet-cpp/main.go
+index 8c7a3b7..2083f21 100644
+--- a/backend/go/parakeet-cpp/main.go
++++ b/backend/go/parakeet-cpp/main.go
+@@ -102,6 +102,12 @@ func main() {
+ 	if sym, err := purego.Dlsym(lib, "parakeet_capi_transcribe_and_diarize_json"); err == nil && sym != 0 {
+ 		purego.RegisterLibFunc(&CppTranscribeAndDiarizeJSON, lib, "parakeet_capi_transcribe_and_diarize_json")
+ 	}
++	if sym, err := purego.Dlsym(lib, "parakeet_capi_diarize_stream_feed"); err == nil && sym != 0 {
++		purego.RegisterLibFunc(&CppDiarStreamBeginLatency, lib, "parakeet_capi_diarize_stream_begin_latency")
++		purego.RegisterLibFunc(&CppDiarStreamFeed, lib, "parakeet_capi_diarize_stream_feed")
++		purego.RegisterLibFunc(&CppDiarStreamFree, lib, "parakeet_capi_diarize_stream_free")
++		purego.RegisterLibFunc(&CppFreeDiarSegments, lib, "parakeet_capi_free_diar_segments")
++	}
+ 	if sym, err := purego.Dlsym(lib, "parakeet_capi_model_kind"); err == nil && sym != 0 {
+ 		purego.RegisterLibFunc(&CppModelKind, lib, "parakeet_capi_model_kind")
+ 		purego.RegisterLibFunc(&CppNumClasses, lib, "parakeet_capi_num_classes")
+diff --git a/backend/go/parakeet-cpp/speakers.go b/backend/go/parakeet-cpp/speakers.go
+index 5ab9a80..51a96e4 100644
+--- a/backend/go/parakeet-cpp/speakers.go
++++ b/backend/go/parakeet-cpp/speakers.go
+@@ -42,6 +42,9 @@ func (p *ParakeetCpp) diarizeSegmentsPCM(pcm []float32) ([]diarizeSegmentJSON, e
+ 	if len(pcm) == 0 {
+ 		return nil, nil
+ 	}
++	if p.diarFeedSec > 0 && CppDiarStreamFeed != nil && len(pcm) > p.diarFeedSec*asrSampleRate {
++		return p.diarizeSegmentsStreamed(pcm)
++	}
+ 	raw, err := p.diarizeCall(pcm, false, 0, false)
+ 	if err != nil {
+ 		return nil, err
+diff --git a/backend/go/parakeet-cpp/wavread.go b/backend/go/parakeet-cpp/wavread.go
+new file mode 100644
+index 0000000..a1609bb
+--- /dev/null
++++ b/backend/go/parakeet-cpp/wavread.go
+@@ -0,0 +1,60 @@
++package main
++
++import (
++	"errors"
++	"io"
++	"math"
++
++	"github.com/go-audio/audio"
++	"github.com/go-audio/wav"
++)
++
++// readWavFloat32 decodes a PCM WAV into float32 samples, a block at a time,
++// into one slice sized from the file header. It returns the same values as
++// wav.Decoder.FullPCMBuffer followed by AsFloat32Buffer, but never holds the
++// clip as a slice of 64-bit integers that grows a few thousand samples at a
++// time. For an hour of 16 kHz audio that growth left about 3 GB of garbage
++// for the Go runtime to collect, which counted against the container's
++// memory cap.
++func readWavFloat32(r io.ReadSeeker) ([]float32, int, error) {
++	dec := wav.NewDecoder(r)
++	dec.ReadInfo()
++	if err := dec.Err(); err != nil {
++		return nil, 0, err
++	}
++	if dec.BitDepth == 0 {
++		return nil, 0, errors.New("parakeet-cpp: wav has no bit depth")
++	}
++	bytesPerSample := (int64(dec.BitDepth)-1)/8 + 1
++	// The header's data length is untrusted: cap the preallocation at the
++	// file's real size, so a forged header cannot ask for gigabytes.
++	claimed := dec.PCMLen()
++	if cur, err := r.Seek(0, io.SeekCurrent); err == nil {
++		if end, err := r.Seek(0, io.SeekEnd); err == nil {
++			if _, err := r.Seek(cur, io.SeekStart); err != nil {
++				return nil, 0, err
++			}
++			if claimed > end {
++				claimed = end
++			}
++		}
++	}
++	expected := int(claimed / bytesPerSample)
++	out := make([]float32, 0, expected)
++
++	factor := math.Pow(2, float64(dec.BitDepth)-1)
++	buf := &audio.IntBuffer{Data: make([]int, 1<<16)}
++	for {
++		n, err := dec.PCMBuffer(buf)
++		for _, v := range buf.Data[:n] {
++			out = append(out, float32(float64(v)/factor))
++		}
++		if err != nil && err != io.EOF {
++			return nil, 0, err
++		}
++		if n == 0 || err == io.EOF {
++			break
++		}
++	}
++	return out, int(dec.SampleRate), nil
++}
+diff --git a/backend/go/parakeet-cpp/wavread_test.go b/backend/go/parakeet-cpp/wavread_test.go
+new file mode 100644
+index 0000000..97fb45b
+--- /dev/null
++++ b/backend/go/parakeet-cpp/wavread_test.go
+@@ -0,0 +1,82 @@
++package main
++
++import (
++	"bytes"
++	"math"
++	"os"
++	"testing"
++
++	"github.com/go-audio/audio"
++	"github.com/go-audio/wav"
++)
++
++// The block reader must return exactly what FullPCMBuffer + AsFloat32Buffer do.
++func TestReadWavFloat32MatchesFullPCMBuffer(t *testing.T) {
++	const n = 3*(1<<16) + 777 // not a multiple of the block size
++	data := make([]int, n)
++	for i := range data {
++		data[i] = int(20000 * math.Sin(float64(i)/37))
++	}
++	dir := t.TempDir()
++	path := dir + "/a.wav"
++	f, err := os.Create(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	enc := wav.NewEncoder(f, 16000, 16, 1, 1)
++	if err := enc.Write(&audio.IntBuffer{Data: data, Format: &audio.Format{NumChannels: 1, SampleRate: 16000}, SourceBitDepth: 16}); err != nil {
++		t.Fatal(err)
++	}
++	if err := enc.Close(); err != nil {
++		t.Fatal(err)
++	}
++	_ = f.Close()
++
++	raw, _ := os.ReadFile(path)
++	want, err := wav.NewDecoder(bytes.NewReader(raw)).FullPCMBuffer()
++	if err != nil {
++		t.Fatal(err)
++	}
++	wf := want.AsFloat32Buffer().Data
++	got, rate, err := readWavFloat32(bytes.NewReader(raw))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if rate != 16000 || len(got) != len(wf) || len(got) != n {
++		t.Fatalf("rate %d, got %d samples, want %d", rate, len(got), len(wf))
++	}
++	for i := range got {
++		if got[i] != wf[i] {
++			t.Fatalf("sample %d: got %v want %v", i, got[i], wf[i])
++		}
++	}
++}
++
++// A header that claims far more data than the file holds must not drive the
++// allocation, and the samples that are there must still decode.
++func TestReadWavFloat32ForgedLength(t *testing.T) {
++	le32 := func(v uint32) []byte { return []byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)} }
++	raw := []byte("RIFF")
++	raw = append(raw, le32(36+8)...)
++	raw = append(raw, "WAVEfmt "...)
++	raw = append(raw, le32(16)...)
++	raw = append(raw, 1, 0, 1, 0)     // PCM, mono
++	raw = append(raw, le32(16000)...) // sample rate
++	raw = append(raw, le32(32000)...) // byte rate
++	raw = append(raw, 2, 0, 16, 0)    // block align, bits
++	raw = append(raw, "data"...)
++	raw = append(raw, le32(8)...)
++	raw = append(raw, 0, 0, 0xE8, 0x03, 0x18, 0xFC, 0xFF, 0x7F) // 0, 1000, -1000, 32767
++	// Forge the data chunk size (bytes 40..43 in a 44-byte header) to 3 GB.
++	raw[40], raw[41], raw[42], raw[43] = 0x00, 0x00, 0x00, 0xC0
++	got, rate, err := readWavFloat32(bytes.NewReader(raw))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if rate != 16000 || len(got) != 4 {
++		t.Fatalf("rate %d, %d samples", rate, len(got))
++	}
++	if cap(got) > 1<<20 {
++		t.Fatalf("capacity %d follows the forged header", cap(got))
++	}
++}
+diff --git a/backend/go/parakeet-cpp/windowed.go b/backend/go/parakeet-cpp/windowed.go
+new file mode 100644
+index 0000000..9ee2fb1
+--- /dev/null
++++ b/backend/go/parakeet-cpp/windowed.go
+@@ -0,0 +1,148 @@
++package main
++
++// Windowed speech-to-text for long recordings.
++//
++// parakeet.cpp encodes a whole clip in one graph, so peak memory grows with
++// the length of the recording (about 0.33 GB per minute of audio above roughly
++// 11 minutes, and with the square of the length below that). When the model
++// option asr_window_seconds is set and a clip is longer than one window, the
++// clip is transcribed in overlapping windows and the words are joined again
++// at a quiet gap inside each overlap. Memory then follows the window, not the
++// recording. Speaker labels are not affected: diarization still runs over the
++// whole clip (speakers.go), so a speaker keeps one label for the whole clip.
++
++const asrSampleRate = 16000
++
++// Words this close to a window edge are not trusted (the encoder has less
++// context there), so a cut is only placed at least this far inside the overlap.
++const asrCutMarginSec = 4.0
++
++// A pause at least this long is a good place to cut; shorter gaps still win
++// when nothing longer is inside the overlap.
++const asrMinGapSec = 0.05
++
++// asrWindowSpan is a half-open range of samples [start, end).
++type asrWindowSpan struct{ start, end int }
++
++// asrWindows lays overlapping windows over n samples. A clip that fits in one
++// window (or windowing off, win <= 0) gets a single span. The last window is
++// stretched back so it is never shorter than overlap, which would leave no
++// room for a cut.
++func asrWindows(n, win, overlap int) []asrWindowSpan {
++	if win <= 0 || n <= win {
++		return []asrWindowSpan{{0, n}}
++	}
++	if overlap < 0 {
++		overlap = 0
++	}
++	if overlap > win/2 {
++		overlap = win / 2
++	}
++	step := win - overlap
++	var out []asrWindowSpan
++	for s := 0; ; s += step {
++		e := s + win
++		if e >= n {
++			out = append(out, asrWindowSpan{s, n})
++			break
++		}
++		out = append(out, asrWindowSpan{s, e})
++	}
++	// A tail shorter than two overlaps adds nothing the last full window
++	// cannot cover, so that window is stretched to the end instead.
++	if len(out) >= 2 && out[len(out)-1].end-out[len(out)-1].start < 2*overlap {
++		out = out[:len(out)-1]
++		out[len(out)-1].end = n
++	}
++	return out
++}
++
++// mergeWindowDocs joins per-window transcripts into one. docs[i] holds the
++// words of window i with times relative to that window; startSec[i] and
++// endSec[i] are where the window begins and ends in the whole clip.
++func mergeWindowDocs(docs []transcriptJSON, startSec, endSec []float64) transcriptJSON {
++	if len(docs) == 1 {
++		return docs[0]
++	}
++	merged := transcriptJSON{FrameSec: docs[0].FrameSec}
++	words := make([][]transcriptWord, len(docs))
++	for i, d := range docs {
++		for _, w := range d.Words {
++			w.Start += startSec[i]
++			w.End += startSec[i]
++			words[i] = append(words[i], w)
++		}
++	}
++	// cuts[i] separates window i from window i+1, inside their overlap.
++	cuts := make([]float64, len(docs)-1)
++	for i := range cuts {
++		cuts[i] = chooseCut(words[i], startSec[i+1], endSec[i])
++	}
++	for i := range docs {
++		from, to := negInf, posInf
++		if i > 0 {
++			from = cuts[i-1]
++		}
++		if i < len(cuts) {
++			to = cuts[i]
++		}
++		for _, w := range words[i] {
++			if mid := (w.Start + w.End) / 2; mid >= from && mid < to {
++				merged.Words = append(merged.Words, w)
++			}
++		}
++		for _, t := range docs[i].Tokens {
++			abs := t.T + startSec[i]
++			if abs >= from && abs < to {
++				t.T = abs
++				merged.Tokens = append(merged.Tokens, t)
++			}
++		}
++	}
++	parts := make([]string, len(merged.Words))
++	for i, w := range merged.Words {
++		parts[i] = w.W
++	}
++	merged.Text = joinWords(parts)
++	return merged
++}
++
++const (
++	posInf = 1e18
++	negInf = -1e18
++)
++
++// chooseCut picks the cut time inside the overlap [from, to]: the middle of
++// the longest pause between two words of the earlier window, keeping
++// asrCutMarginSec away from both edges. With no pause there, or no room for
++// the margins, it is the middle of the overlap.
++func chooseCut(ws []transcriptWord, from, to float64) float64 {
++	lo, hi := from+asrCutMarginSec, to-asrCutMarginSec
++	if hi <= lo {
++		return (from + to) / 2
++	}
++	best, bestLen := (lo+hi)/2, 0.0
++	for i := 1; i < len(ws); i++ {
++		g := ws[i].Start - ws[i-1].End
++		mid := (ws[i].Start + ws[i-1].End) / 2
++		if g >= asrMinGapSec && g > bestLen && mid >= lo && mid <= hi {
++			best, bestLen = mid, g
++		}
++	}
++	return best
++}
++
++func joinWords(parts []string) string {
++	n := 0
++	for _, p := range parts {
++		n += len(p) + 1
++	}
++	b := make([]byte, 0, n)
++	for i, p := range parts {
++		if i > 0 {
++			b = append(b, ' ')
++		}
++		b = append(b, p...)
++	}
++	return string(b)
++}
+diff --git a/backend/go/parakeet-cpp/windowed_test.go b/backend/go/parakeet-cpp/windowed_test.go
+new file mode 100644
+index 0000000..4bd9c22
+--- /dev/null
++++ b/backend/go/parakeet-cpp/windowed_test.go
+@@ -0,0 +1,111 @@
++package main
++
++import (
++	"fmt"
++	"testing"
++)
++
++func TestAsrWindowsShortClipIsOneWindow(t *testing.T) {
++	if got := asrWindows(100, 0, 10); len(got) != 1 || got[0] != (asrWindowSpan{0, 100}) {
++		t.Fatalf("windowing off: %v", got)
++	}
++	if got := asrWindows(100, 100, 10); len(got) != 1 {
++		t.Fatalf("clip equal to a window: %v", got)
++	}
++}
++
++func TestAsrWindowsOverlapAndCoverage(t *testing.T) {
++	got := asrWindows(1000, 300, 50)
++	if got[0].start != 0 || got[len(got)-1].end != 1000 {
++		t.Fatalf("does not cover the clip: %v", got)
++	}
++	for i := 1; i < len(got); i++ {
++		if ov := got[i-1].end - got[i].start; ov < 50 {
++			t.Fatalf("window %d overlaps the previous by %d, want at least 50: %v", i, ov, got)
++		}
++		if got[i].end-got[i].start < 100 {
++			t.Fatalf("window %d is a sliver: %v", i, got)
++		}
++	}
++}
++
++func TestAsrWindowsShortTailIsFoldedIn(t *testing.T) {
++	got := asrWindows(560, 300, 50) // second window would be 250..550, then a 10 sample tail
++	if got[len(got)-1].end != 560 {
++		t.Fatalf("tail lost: %v", got)
++	}
++	for _, w := range got {
++		if w.end-w.start < 100 {
++			t.Fatalf("sliver window: %v", got)
++		}
++	}
++}
++
++// speech builds words one per second from a to b (absolute seconds) with a
++// pause of pause seconds before the word that starts at pauseAt.
++func speech(a, b int, pauseAt int, pause float64) []transcriptWord {
++	var ws []transcriptWord
++	shift := 0.0
++	for s := a; s < b; s++ {
++		if s == pauseAt {
++			shift = pause
++		}
++		ws = append(ws, transcriptWord{W: fmt.Sprintf("w%d", s), Start: float64(s) + shift, End: float64(s) + shift + 0.5})
++	}
++	return ws
++}
++
++func relTo(ws []transcriptWord, start float64) []transcriptWord {
++	out := make([]transcriptWord, len(ws))
++	for i, w := range ws {
++		w.Start -= start
++		w.End -= start
++		out[i] = w
++	}
++	return out
++}
++
++func TestMergeWindowDocsDropsDuplicatesAndCutsAtPause(t *testing.T) {
++	// A 100 second clip in windows 0..60 and 40..100 (20 second overlap), a
++	// 0.3 second pause before word 50.
++	all := speech(0, 100, 50, 0.3)
++	var a, b []transcriptWord
++	for _, w := range all {
++		if w.Start < 60 {
++			a = append(a, w)
++		}
++		if w.End > 40 {
++			b = append(b, w)
++		}
++	}
++	docs := []transcriptJSON{{Words: relTo(a, 0), FrameSec: 0.08}, {Words: relTo(b, 40)}}
++	m := mergeWindowDocs(docs, []float64{0, 40}, []float64{60, 100})
++	if len(m.Words) != len(all) {
++		t.Fatalf("got %d words, want %d", len(m.Words), len(all))
++	}
++	for i, w := range m.Words {
++		if w.W != all[i].W {
++			t.Fatalf("word %d is %q, want %q", i, w.W, all[i].W)
++		}
++	}
++	if m.FrameSec != 0.08 {
++		t.Fatalf("frame_sec lost")
++	}
++}
++
++func TestChooseCutPrefersTheLongestPauseInsideTheMargins(t *testing.T) {
++	ws := []transcriptWord{
++		{W: "a", Start: 40.1, End: 40.5}, // gap before it is outside the margin
++		{W: "b", Start: 46.0, End: 46.4},
++		{W: "c", Start: 46.6, End: 47.0}, // 0.2 pause
++		{W: "d", Start: 48.0, End: 48.4}, // 1.0 pause: the longest
++		{W: "e", Start: 48.5, End: 48.9},
++	}
++	got := chooseCut(ws, 40, 60)
++	if want := (47.0 + 48.0) / 2; got != want {
++		t.Fatalf("cut %v, want %v", got, want)
++	}
++	if got := chooseCut(nil, 40, 60); got != 50 {
++		t.Fatalf("no words: cut %v, want the middle, 50", got)
++	}
++}
+-- 
+2.47.3
+
